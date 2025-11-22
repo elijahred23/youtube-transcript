@@ -1,0 +1,64 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker Image (YouTube Transcript API)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Log in to Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Build and push Docker image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # If your Dockerfile is in repo root, this is fine.
+          # Otherwise set: file: path/to/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/youtube-transcript-api:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/youtube-transcript-api:${{ github.sha }}
+
+  deploy:
+    name: Deploy to DigitalOcean Kubernetes
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+      uses: actions/checkout@v4
+
+      # Install doctl (binary)
+      - name: Install doctl
+        run: |
+          curl -sL https://github.com/digitalocean/doctl/releases/download/v1.108.0/doctl-1.108.0-linux-amd64.tar.gz -o doctl.tar.gz
+          tar -xzf doctl.tar.gz
+          sudo mv doctl /usr/local/bin/
+
+      - name: Authenticate doctl
+        run: doctl auth init -t "${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}"
+
+      - name: Fetch kubeconfig
+        run: doctl kubernetes cluster kubeconfig save eli-k8s
+
+      # Update the image on your deployment
+      - name: Deploy new image to Kubernetes
+        run: |
+          kubectl set image deployment/youtube-transcript-api youtube-transcript-api=${{ secrets.DOCKERHUB_USERNAME }}/youtube-transcript-api:${{ github.sha }}
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/youtube-transcript-api --timeout=120s
