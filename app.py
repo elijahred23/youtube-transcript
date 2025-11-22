@@ -1,8 +1,12 @@
 import base64
 from flask import Flask, request, jsonify
 from youtube_service import get_video_id, fetch_transcript
+from flask_cors import CORS
 
 app = Flask(__name__)
+
+# Allow all domains to access this API
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 def decode_url_if_base64(url):
     """
