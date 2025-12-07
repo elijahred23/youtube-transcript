@@ -1,7 +1,26 @@
+import functools
+from collections import OrderedDict
 import re
+from urllib.parse import parse_qs, urlparse
+
 import requests
+from requests.adapters import HTTPAdapter
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import WebshareProxyConfig
+
+# Lightweight session with connection pooling to avoid recreating sockets on every call
+_session = requests.Session()
+_session.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=8))
+
+# Pre-compiled regex for filename sanitization
+_ILLEGAL_FILENAME_CHARS = re.compile(r'[\\/*?:"<>|]')
+
+# Preferred transcript languages in order
+_PREFERRED_LANGS = ["en", "en-US", "en-GB"]
+
+# Simple in-memory LRU cache for transcripts
+_TRANSCRIPT_CACHE: OrderedDict[str, str] = OrderedDict()
+_MAX_TRANSCRIPT_CACHE = 10
 
 
 # ----------------------------
@@ -17,15 +36,29 @@ def create_api():
     )
 
 
+# Cache the API client so we do not rebuild it for every request
+create_api = functools.lru_cache(maxsize=1)(create_api)
+
+
 # ----------------------------
 #   Extract Video ID
 # ----------------------------
 def get_video_id(url: str) -> str:
-    if "youtu.be" in url:
-        return url.split("/")[-1].split("?")[0]
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
 
-    if "youtube.com" in url and "v=" in url:
-        return url.split("v=")[1].split("&")[0]
+    if "youtu.be" in hostname:
+        # Short link format: https://youtu.be/<id>
+        video_id = parsed.path.lstrip("/")
+        if video_id:
+            return video_id
+
+    if "youtube.com" in hostname:
+        # Standard format: https://www.youtube.com/watch?v=<id>
+        qs = parse_qs(parsed.query)
+        video_id = qs.get("v", [None])[0]
+        if video_id:
+            return video_id
 
     raise ValueError("Invalid YouTube URL")
 
@@ -37,18 +70,31 @@ def get_video_title(video_id: str):
     oembed = f"https://www.youtube.com/oembed?url=http://www.youtube.com/watch?v={video_id}&format=json"
 
     try:
-        r = requests.get(oembed, timeout=10)
+        r = _session.get(oembed, timeout=10)
         r.raise_for_status()
         return r.json().get("title", f"Video_{video_id}")
     except Exception:
         return f"Video_{video_id}"
 
 
+# Title lookup is cacheable; titles do not change often and it avoids repeated network calls
+get_video_title = functools.lru_cache(maxsize=128)(get_video_title)
+
+
 # ----------------------------
 #   Remove illegal filename chars
 # ----------------------------
 def sanitize_filename(title: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "", title)
+    return _ILLEGAL_FILENAME_CHARS.sub("", title)
+
+
+def _cache_transcript(video_id: str, transcript: str) -> None:
+    # Keep a tiny LRU of the last few transcripts to avoid refetching
+    if video_id in _TRANSCRIPT_CACHE:
+        _TRANSCRIPT_CACHE.move_to_end(video_id)
+    _TRANSCRIPT_CACHE[video_id] = transcript
+    if len(_TRANSCRIPT_CACHE) > _MAX_TRANSCRIPT_CACHE:
+        _TRANSCRIPT_CACHE.popitem(last=False)
 
 
 # ----------------------------
@@ -56,6 +102,9 @@ def sanitize_filename(title: str) -> str:
 # ----------------------------
 def fetch_transcript(video_id: str):
     try:
+        if video_id in _TRANSCRIPT_CACHE:
+            return _TRANSCRIPT_CACHE[video_id]
+
         ytt = create_api()
 
         # List all available transcripts for the video
@@ -63,20 +112,30 @@ def fetch_transcript(video_id: str):
 
         # Prefer English; fallback to first available
         try:
-            transcript = transcript_list.find_transcript(["en", "en-US", "en-GB"])
-        except:
+            transcript = transcript_list.find_transcript(_PREFERRED_LANGS)
+        except Exception:
             available = list(transcript_list)
             if not available:
                 return {"error": "No transcripts available for this video."}
             transcript = available[0]
 
-        # Fetch transcript data
+        # Fetch transcript data and handle both dict and object forms
         fetched = transcript.fetch()
-        raw = fetched.to_raw_data()
 
-        # Return as one clean string
-        combined = " ".join(item["text"] for item in raw)
+        def _extract_text(snippet):
+            if snippet is None:
+                return ""
+            # Newer youtube_transcript_api returns objects with .text
+            text_attr = getattr(snippet, "text", None)
+            if text_attr:
+                return text_attr
+            # Older versions return dicts
+            if isinstance(snippet, dict):
+                return snippet.get("text", "")
+            return ""
 
+        combined = " ".join(filter(None, (_extract_text(s) for s in fetched))).strip()
+        _cache_transcript(video_id, combined)
         return combined
 
     except Exception as e:
