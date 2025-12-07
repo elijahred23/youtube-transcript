@@ -8,4 +8,11 @@ services:
     environment:
       # Add env vars here if you decide to externalize proxy credentials, etc.
       FLASK_ENV: development
+      REDIS_URL: redis://redis:6379/0
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
     restart: unless-stopped

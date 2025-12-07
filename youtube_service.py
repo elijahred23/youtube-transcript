@@ -1,4 +1,5 @@
 import functools
+import os
 from collections import OrderedDict
 import re
 from urllib.parse import parse_qs, urlparse
@@ -7,6 +8,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import WebshareProxyConfig
+import redis
 
 # Lightweight session with connection pooling to avoid recreating sockets on every call
 _session = requests.Session()
@@ -21,6 +23,29 @@ _PREFERRED_LANGS = ["en", "en-US", "en-GB"]
 # Simple in-memory LRU cache for transcripts
 _TRANSCRIPT_CACHE: OrderedDict[str, str] = OrderedDict()
 _MAX_TRANSCRIPT_CACHE = 10
+
+_REDIS_URL = os.getenv("REDIS_URL")
+_REDIS_LRU_KEY = "transcript:lru"
+_REDIS_PREFIX = "transcript:cache:"
+
+
+def _create_redis_client():
+    if not _REDIS_URL:
+        return None
+    try:
+        client = redis.from_url(
+            _REDIS_URL,
+            decode_responses=True,
+            socket_timeout=2,
+            socket_connect_timeout=2,
+        )
+        client.ping()
+        return client
+    except Exception:
+        return None
+
+
+_REDIS_CLIENT = _create_redis_client()
 
 
 # ----------------------------
@@ -96,14 +121,50 @@ def _cache_transcript(video_id: str, transcript: str) -> None:
     if len(_TRANSCRIPT_CACHE) > _MAX_TRANSCRIPT_CACHE:
         _TRANSCRIPT_CACHE.popitem(last=False)
 
+    if _REDIS_CLIENT:
+        try:
+            pipe = _REDIS_CLIENT.pipeline()
+            pipe.lrem(_REDIS_LRU_KEY, 0, video_id)
+            pipe.lpush(_REDIS_LRU_KEY, video_id)
+            pipe.ltrim(_REDIS_LRU_KEY, 0, _MAX_TRANSCRIPT_CACHE - 1)
+            pipe.set(f"{_REDIS_PREFIX}{video_id}", transcript)
+            pipe.execute()
+
+            # prune keys not present in the trimmed LRU list (keeps storage bounded)
+            allowed_ids = set(_REDIS_CLIENT.lrange(_REDIS_LRU_KEY, 0, -1))
+            for key in _REDIS_CLIENT.scan_iter(f"{_REDIS_PREFIX}*"):
+                vid = key.replace(_REDIS_PREFIX, "", 1)
+                if vid not in allowed_ids:
+                    _REDIS_CLIENT.delete(key)
+        except Exception:
+            # Ignore Redis errors and continue with local cache
+            pass
+
+
+def _get_cached_transcript(video_id: str):
+    if video_id in _TRANSCRIPT_CACHE:
+        return _TRANSCRIPT_CACHE[video_id]
+
+    if _REDIS_CLIENT:
+        try:
+            cached = _REDIS_CLIENT.get(f"{_REDIS_PREFIX}{video_id}")
+            if cached:
+                # Mirror into local cache for faster repeat access in-process
+                _cache_transcript(video_id, cached)
+                return cached
+        except Exception:
+            pass
+    return None
+
 
 # ----------------------------
 #   Fetch Transcript (ONE STRING)
 # ----------------------------
 def fetch_transcript(video_id: str):
     try:
-        if video_id in _TRANSCRIPT_CACHE:
-            return _TRANSCRIPT_CACHE[video_id]
+        cached = _get_cached_transcript(video_id)
+        if cached is not None:
+            return cached
 
         ytt = create_api()
 
