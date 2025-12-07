@@ -22,7 +22,7 @@ _PREFERRED_LANGS = ["en", "en-US", "en-GB"]
 
 # Simple in-memory LRU cache for transcripts
 _TRANSCRIPT_CACHE: OrderedDict[str, str] = OrderedDict()
-_MAX_TRANSCRIPT_CACHE = 10
+_MAX_TRANSCRIPT_CACHE = 50 
 
 _REDIS_URL = os.getenv("REDIS_URL")
 _REDIS_LRU_KEY = "transcript:lru"
