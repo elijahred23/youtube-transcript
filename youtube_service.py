@@ -1,5 +1,6 @@
 import functools
 import os
+import time
 from collections import OrderedDict
 import re
 from urllib.parse import parse_qs, urlparse
@@ -161,11 +162,11 @@ def _get_cached_transcript(video_id: str):
 #   Fetch Transcript (ONE STRING)
 # ----------------------------
 def fetch_transcript(video_id: str):
-    try:
-        cached = _get_cached_transcript(video_id)
-        if cached is not None:
-            return cached
+    cached = _get_cached_transcript(video_id)
+    if cached is not None:
+        return cached
 
+    def _fetch_once():
         ytt = create_api()
 
         # List all available transcripts for the video
@@ -196,8 +197,24 @@ def fetch_transcript(video_id: str):
             return ""
 
         combined = " ".join(filter(None, (_extract_text(s) for s in fetched))).strip()
-        _cache_transcript(video_id, combined)
         return combined
 
-    except Exception as e:
-        return {"error": f"{e}"}
+    attempts = 0
+    last_error = None
+    while attempts < 4:  # initial attempt + up to 3 retries
+        try:
+            result = _fetch_once()
+            if isinstance(result, dict) and result.get("error"):
+                # Don't retry for deterministic errors like no transcripts
+                return result
+            _cache_transcript(video_id, result)
+            return result
+        except Exception as e:
+            last_error = e
+            attempts += 1
+            if attempts >= 4:
+                break
+            # simple linear backoff
+            time.sleep(0.5 * attempts)
+
+    return {"error": f"{last_error}" if last_error else "Failed to fetch transcript"}
